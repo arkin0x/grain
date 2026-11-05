@@ -23,11 +23,15 @@ const (
 	// purgeRunBudget caps deletes per run so the DB trends to steady state
 	// rather than accumulating a full retention window of backlog each pass.
 	purgeRunBudget = 100000
-	// purgePageSize is the per-kind page walked through the kind index.
-	purgePageSize = 500
+	// purgeKindPageSize is the default per-kind page walked through the kind index.
+	purgeKindPageSize = 500
 	// maxEventKind is the largest kind NIP-01 allows.
 	maxEventKind = 65535
 )
+
+// purgePageSize is the per-kind page walked through the kind index. A
+// variable only so tests can cross page boundaries with a few events.
+var purgePageSize = purgeKindPageSize
 
 // PurgeOldEvents removes events older than the configured retention window.
 // An event's age runs from its created_at or, under the received retention
@@ -177,30 +181,26 @@ func (db *NDB) purgeKind(kind int, cutoff int64, whitelistSet map[string]bool, e
 	}
 	deleted, failed := 0, 0
 	keptLate := make(map[string]struct{}) // by id: a window can be re-queried
-	until := cutoff
+	start := time.Unix(cutoff, 0)
+	// The cursor re-asks for the oldest second of each page and skips what it
+	// already handed out there: kept events, and deleted ones, which are gone
+	// anyway. Same-second remainders past a page are reached.
+	cursor := NewPageCursor(&start)
 
 	for deleted < budget {
 		lim := purgePageSize
-		untilTime := time.Unix(until, 0)
 		events, err := db.Query([]nostr.Filter{{
 			Kinds: []int{kind},
-			Until: &untilTime,
+			Until: cursor.Until(),
 			Limit: &lim,
 		}}, purgePageSize)
 		if err != nil {
 			log.DBPurge().Warn("Purge query failed for kind", "kind", kind, "error", err)
 			break
 		}
-		if len(events) == 0 {
-			break
-		}
+		fresh, more := cursor.Next(events, purgePageSize)
 
-		oldest := until
-		del := 0
-		for _, evt := range events {
-			if evt.CreatedAt < oldest {
-				oldest = evt.CreatedAt
-			}
+		for _, evt := range fresh {
 			if excludeWhitelisted && whitelistSet[evt.PubKey] {
 				continue
 			}
@@ -220,22 +220,17 @@ func (db *NDB) purgeKind(kind int, cutoff int64, whitelistSet map[string]bool, e
 				continue
 			}
 			deleted++
-			del++
 			if deleted >= budget {
 				break
 			}
 		}
-
-		// Advance the cursor. When we deleted from this window, re-query at the
-		// same oldest (inclusive): the deleted events are gone so the set shrinks
-		// and same-second remainders are still reached — this terminates because
-		// each pass removes at least one event <= oldest. When we deleted nothing
-		// (a boundary of only kept events), step strictly past it.
-		if del > 0 {
-			until = oldest
-		} else {
-			until = oldest - 1
+		if !more {
+			break
 		}
+	}
+	if cursor.Crowded {
+		log.DBPurge().Warn("A second filled a whole purge page; some of its events may not be reached this run",
+			"kind", kind, "page_size", purgePageSize)
 	}
 	return deleted, failed, len(keptLate)
 }
